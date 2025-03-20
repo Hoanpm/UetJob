@@ -40,7 +40,8 @@
 #  settings                  :text
 #  time_zone                 :string
 #  otp_secret                :string
-#
+#  user_type                 :string           default("guest")
+#  saved_jobs                :jsonb            default([])
 
 class User < ApplicationRecord
   self.ignored_columns += %w(
@@ -68,6 +69,10 @@ class User < ApplicationRecord
   # every day. Raising the duration reduces the amount of expensive
   # RegenerationWorker jobs that need to be run when those people come
   # to check their feed
+
+  # Definition of user type
+  enum :user_type, { guest: 'guest', student: 'student', organization: 'organization' }
+
   ACTIVE_DURATION = ENV.fetch('USER_ACTIVE_DAYS', 7).to_i.days.freeze
 
   devise :two_factor_authenticatable,
@@ -86,6 +91,7 @@ class User < ApplicationRecord
   belongs_to :invite, counter_cache: :uses, optional: true
   belongs_to :created_by_application, class_name: 'Doorkeeper::Application', optional: true
   belongs_to :role, class_name: 'UserRole', optional: true
+  belongs_to :organization, optional: true
   accepts_nested_attributes_for :account
 
   has_many :applications, class_name: 'Doorkeeper::Application', as: :owner, dependent: nil
@@ -126,9 +132,15 @@ class User < ApplicationRecord
   scope :not_signed_in_recently, -> { where(current_sign_in_at: ...ACTIVE_DURATION.ago) }
   scope :matches_email, ->(value) { where(arel_table[:email].matches("#{value}%")) }
   scope :matches_ip, ->(value) { left_joins(:ips).merge(IpBlock.contained_by(value)).group(users: [:id]) }
+  scope :students, -> { where(user_type: 'student') }
+  scope :organizations, -> { where(user_type: 'organization') }
+  scope :guests, -> { where(user_type: 'guest') }
 
   before_validation :sanitize_role
   before_create :set_approved
+  # Check email domain when create a new account
+  before_create :set_user_type_from_email
+  after_create :auto_join_organization_by_email_domain
   after_commit :send_pending_devise_notifications
   after_create_commit :trigger_webhooks
 
@@ -142,6 +154,38 @@ class User < ApplicationRecord
 
   attr_reader :invite_code
   attr_writer :external, :bypass_invite_request_check, :current_account
+
+  def student? 
+    user_type == 'student'
+  end
+
+  def organization? 
+    user_type == 'organization'
+  end
+
+  def guest? 
+    user_type == 'guest'
+  end
+
+  def can_post_job? 
+    organization? && organization.present?
+  end
+
+  def can_seek_job?
+    student? || organization?
+  end
+  
+  def can_apply_job?
+    student?
+  end
+
+  def in_organization?
+    organization.present?
+  end
+
+  def email_domain
+    email.split('@').last if email.present?
+  end
 
   def self.those_who_can(*any_of_privileges)
     matching_role_ids = UserRole.that_can(*any_of_privileges).map(&:id)
@@ -536,5 +580,30 @@ class User < ApplicationRecord
 
   def trigger_webhooks
     TriggerWebhookWorker.perform_async('account.created', 'Account', account_id)
+  end
+
+  def set_user_type_from_email
+    if email.present?
+      if email.end_with?('@vnu.edu.vn')
+        self.user_type = 'student'
+      elsif email.end_with?('@gmail.com')
+        self.user_type = 'guest'
+      else 
+        self.user_type = 'organization'
+      end
+    end
+  end
+
+  def auto_join_organization_by_email_domain
+    return unless organization?
+
+    domain = email_domain
+    return unless domain.present?
+
+    org = Organization.find_by(email_domain: domain)
+    
+    if org
+      update(organization: org)
+    end
   end
 end
